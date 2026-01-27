@@ -426,7 +426,9 @@ def export_trace(trace_model: LangfuseTrace, settings: Settings, dry_run: bool =
             provider = trace.get_tracer_provider()
             flush_fn = getattr(provider, "force_flush", None)
             if callable(flush_fn):
+                logger.debug("Calling force_flush")
                 flush_fn()
+                logger.debug("force_flush returned")
                 _last_flushed_spans_created = _total_spans_created
                 flushed_this_cycle = True
         except Exception:  # pragma: no cover

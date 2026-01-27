@@ -430,12 +430,14 @@ def shipper(
                 logging.getLogger(__name__).debug(
                     "Execution %s mapped to %d spans", record.id, span_count
                 )
+            logging.getLogger(__name__).debug("Calling export_trace")
             export_trace(
                 trace,
                 settings,
                 dry_run=effective_dry_run,
                 langfuse_trace_id_field_name=settings.LANGFUSE_TRACE_ID_FIELD_NAME,
             )
+            logging.getLogger(__name__).debug("Returned from export_trace")
             if settings.ENABLE_MEDIA_UPLOAD and mapped is not None:
                 # Now that OTLP span ids are populated, perform media create + upload.
                 try:

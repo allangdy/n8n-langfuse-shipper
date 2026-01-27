@@ -196,6 +196,7 @@ class ExecutionSource:
             )
             params = [last_id] + params + [limit]
         async with conn.cursor(row_factory=dict_row) as cur:
+            logger.debug("Executing batch fetch SQL")
             try:
                 await cur.execute(sql, tuple(params))
             except Exception as ex:  # noqa: BLE001 broad for friendly diagnostics then re-raise
