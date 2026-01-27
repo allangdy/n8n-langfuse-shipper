@@ -430,14 +430,12 @@ def shipper(
                 logging.getLogger(__name__).debug(
                     "Execution %s mapped to %d spans", record.id, span_count
                 )
-            logging.getLogger(__name__).debug("Calling export_trace")
             export_trace(
                 trace,
                 settings,
                 dry_run=effective_dry_run,
                 langfuse_trace_id_field_name=settings.LANGFUSE_TRACE_ID_FIELD_NAME,
             )
-            logging.getLogger(__name__).debug("Returned from export_trace")
             if settings.ENABLE_MEDIA_UPLOAD and mapped is not None:
                 # Now that OTLP span ids are populated, perform media create + upload.
                 try:
@@ -461,6 +459,25 @@ def shipper(
                 )
             count += 1
             last_id = int(record.id)
+
+            # Periodic checkpointing for long-running stream safety.
+            # Strategy: Only checkpoint when we are sure the OTLP exporter has flushed the data
+            # (count is multiple of FLUSH_EVERY_N_TRACES) AND we have processed a reasonable
+            # batch (e.g. >= 50) to avoid excessive disk I/O.
+            if not effective_dry_run:
+                flush_n = max(1, settings.FLUSH_EVERY_N_TRACES)
+                # Ensure checkpoint_n is a multiple of flush_n and >= 50
+                min_batch = 50
+                if flush_n >= min_batch:
+                    checkpoint_n = flush_n
+                else:
+                    # Round up min_batch to next multiple of flush_n
+                    checkpoint_n = ((min_batch + flush_n - 1) // flush_n) * flush_n
+                
+                if count % checkpoint_n == 0:
+                    store_checkpoint(cp_path, last_id)
+                    logging.getLogger(__name__).debug("Stored periodic checkpoint id %s", last_id)
+
         if not effective_dry_run and last_id is not None:
             store_checkpoint(cp_path, last_id)
             logging.getLogger(__name__).info(

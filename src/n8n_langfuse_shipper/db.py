@@ -60,8 +60,8 @@ class ExecutionSource:
     ):
         """Initialize the execution source and resolve database configuration.
 
-    The schema is resolved via explicit arg -> env -> default 'public'.
-    The table prefix is mandatory (explicit arg or DB_TABLE_PREFIX env). No implicit default.
+        The schema is resolved via explicit arg -> env -> default 'public'.
+        The table prefix is mandatory (explicit arg or DB_TABLE_PREFIX env). No implicit default.
 
         Args:
             dsn: The full PostgreSQL connection string.
@@ -128,34 +128,13 @@ class ExecutionSource:
             except Exception:  # pragma: no cover - best effort
                 logger.debug("Error closing Postgres connection", exc_info=True)
 
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
-        retry=retry_if_exception_type(Exception),
-    )
     async def _fetch_batch(
         self, conn: Any, last_id: int, limit: int
     ) -> List[Dict[str, Any]]:
         """Fetch a single batch of execution records from the database.
 
         This method executes a SQL query to get the next batch of records after
-        a given ID. It is decorated with `tenacity.retry` to handle transient
-        database errors with exponential backoff.
-
-        The SQL query is constructed dynamically to include the correct schema
-        and table prefix. If `_require_execution_metadata` is True, it adds an
-        `EXISTS` clause to filter for executions with associated metadata.
-
-        Args:
-            conn: The active async database connection.
-            last_id: The ID of the last record from the previous batch, used for
-                pagination.
-            limit: The maximum number of records to fetch.
-
-        Returns:
-            A list of dictionaries, where each dictionary represents a fetched
-            execution record.
+        a given ID. It includes a timeout to unstick hangs.
         """
         # Table names with prefix
         entity_table = f'"{self._schema}"."{self._entity_table_name}"'
@@ -196,9 +175,10 @@ class ExecutionSource:
             )
             params = [last_id] + params + [limit]
         async with conn.cursor(row_factory=dict_row) as cur:
-            logger.debug("Executing batch fetch SQL")
+            logger.debug("Executing batch fetch SQL (last_id=%s)", last_id)
             try:
-                await cur.execute(sql, tuple(params))
+                # Add explicit timeout to unstick hangs
+                await asyncio.wait_for(cur.execute(sql, tuple(params)), timeout=30.0)
             except Exception as ex:  # noqa: BLE001 broad for friendly diagnostics then re-raise
                 # Rollback transaction if it's in failed state to allow subsequent attempts
                 try:
@@ -246,41 +226,45 @@ class ExecutionSource:
         last_id = start_after_id or 0
         yielded = 0
 
-        try:
-            async with self._connect() as conn:
-                while True:
-                    if limit is not None:
-                        remaining = limit - yielded
-                        if remaining <= 0:
-                            break
-                        batch_limit = min(self._batch_size, remaining)
-                    else:
-                        batch_limit = self._batch_size
+        while True:
+            # Check global limits before connecting
+            if limit is not None and yielded >= limit:
+                break
 
-                    try:
+            try:
+                async with self._connect() as conn:
+                    # Connection established - enter batch loop
+                    while True:
+                        if limit is not None:
+                            remaining = limit - yielded
+                            if remaining <= 0:
+                                break
+                            batch_limit = min(self._batch_size, remaining)
+                        else:
+                            batch_limit = self._batch_size
+
+                        # Fetch with timeout
                         rows = await self._fetch_batch(conn, last_id, batch_limit)
-                    except Exception as e:
-                        logger.error("Failed fetching batch after id %s: %s", last_id, e, exc_info=True)
-                        raise
 
-                    if not rows:
-                        break
+                        if not rows:
+                            # End of table reached
+                            # Log and exit cleanly
+                            logger.info(
+                                "Stream completed: yielded=%d start_after_id=%s final_last_id=%d", yielded, start_after_id, last_id
+                            )
+                            return
 
-                    for row in rows:
-                        yield row
-                        yielded += 1
-                        last_id = row["id"]
-                        if limit is not None and yielded >= limit:
-                            break
+                        for row in rows:
+                            yield row
+                            yielded += 1
+                            last_id = row["id"]
+                            if limit is not None and yielded >= limit:
+                                break
+                        
+                        # Small yield to event loop
+                        await asyncio.sleep(0)
 
-                    if limit is not None and yielded >= limit:
-                        break
-
-                    await asyncio.sleep(0)
-        except Exception as conn_err:  # pragma: no cover - integration environment dependent
-            # Gracefully degrade when DB unreachable so tests without a live Postgres skip behaviorally.
-            logger.warning("Database connection/stream failed: %s (yielded=%d). Returning no rows.", conn_err, yielded)
-            return
-        logger.info(
-            "Stream completed: yielded=%d start_after_id=%s final_last_id=%d", yielded, start_after_id, last_id
-        )
+            except Exception as e:
+                # Log error and retry connection (infinite retry loop)
+                logger.error("Streaming error (last_id=%s): %s. Reconnecting in 5s...", last_id, e)
+                await asyncio.sleep(5)

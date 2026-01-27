@@ -12,7 +12,8 @@ services:
       DB_POSTGRESDB_USER: ${DB_POSTGRESDB_USER:-postgres}
       DB_POSTGRESDB_PASSWORD: ${DB_POSTGRESDB_PASSWORD:-}
       DB_POSTGRESDB_SCHEMA: ${DB_POSTGRESDB_SCHEMA:-public}
-      DB_TABLE_PREFIX: ${DB_TABLE_PREFIX:-n8n_}
+      LANGFUSE_ENV: production
+      DB_TABLE_PREFIX: ""
       LANGFUSE_HOST: ${LANGFUSE_HOST:-}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
@@ -31,9 +32,9 @@ services:
       EXPORT_SLEEP_MS: ${EXPORT_SLEEP_MS:-75}
       CHECKPOINT_FILE: /data/.shipper_checkpoint
     volumes:
-      - shipper-checkpoint:/data
+      - shipper-checkpoint3:/data
     # Override default dry-run to perform real export (remove --no-dry-run for dry runs)
-    command: ["--limit", "200", "--no-dry-run"]
+    command: ["--limit", "200", "--no-dry-run", "--filter-ai-only"]
     restart: unless-stopped
     # Uncomment to join an existing external network where Postgres & Langfuse live
     # networks:
@@ -52,7 +53,7 @@ services:
   #     - pgdata:/var/lib/postgresql/data
 
 volumes:
-  shipper-checkpoint:
+  shipper-checkpoint3:
   # pgdata:
 
 # networks:
