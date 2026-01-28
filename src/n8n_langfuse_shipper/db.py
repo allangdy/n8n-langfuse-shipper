@@ -129,18 +129,36 @@ class ExecutionSource:
                 logger.debug("Error closing Postgres connection", exc_info=True)
 
     async def _fetch_batch(
-        self, conn: Any, last_id: int, limit: int
+        self, conn: Any, last_id: int, last_stopped_at: Optional[str], limit: int
     ) -> List[Dict[str, Any]]:
         """Fetch a single batch of execution records from the database.
 
         This method executes a SQL query to get the next batch of records after
-        a given ID. It includes a timeout to unstick hangs.
+        a given cursor (stoppedAt, id). It includes a timeout to unstick hangs.
         """
         # Table names with prefix
         entity_table = f'"{self._schema}"."{self._entity_table_name}"'
         data_table = f'"{self._schema}"."{self._data_table_name}"'
         wf_filter_clause = ""
         params: List[Any] = []
+        
+        # Cursor clause
+        # Primary sort: stoppedAt (ensure we process in completion order)
+        # Secondary sort: id (tie-breaker)
+        # Filter: stoppedAt IS NOT NULL (only finished executions)
+        cursor_clause = 'e."stoppedAt" IS NOT NULL'
+        
+        if last_stopped_at:
+            # Standard tuple comparison: (stoppedAt, id) > (last_stopped, last_id)
+            # Equivalent to: stoppedAt > last OR (stoppedAt = last AND id > last_id)
+            cursor_clause += ' AND (e."stoppedAt" > %s OR (e."stoppedAt" = %s AND e.id > %s))'
+            params.extend([last_stopped_at, last_stopped_at, last_id])
+        else:
+            # Fallback for initial run or legacy checkpoint: just use ID if provided, but still require stoppedAt
+            if last_id > 0:
+                cursor_clause += ' AND e.id > %s'
+                params.append(last_id)
+
         if self._filter_workflow_ids:
             # Use = ANY(%s) style array matching for safety & simplicity.
             # psycopg will adapt list to array automatically.
@@ -157,11 +175,11 @@ class ExecutionSource:
                 f'd."workflowData" AS "workflowData", d."data" AS data '
                 f'FROM {entity_table} e '
                 f'JOIN {data_table} d ON e.id = d."executionId" '
-                f'WHERE e.id > %s AND EXISTS (SELECT 1 FROM {meta_table} m WHERE m."executionId" = e.id){wf_filter_clause} '
-                'ORDER BY e.id ASC '
+                f'WHERE {cursor_clause}{wf_filter_clause} '
+                'ORDER BY e."stoppedAt" ASC, e.id ASC '
                 'LIMIT %s'
             )
-            params = [last_id] + params + [limit]
+            params.append(limit)
         else:
             sql = (
                 f'SELECT e.id, e."workflowId" AS "workflowId", e.status, '
@@ -169,13 +187,13 @@ class ExecutionSource:
                 f'd."workflowData" AS "workflowData", d."data" AS data '
                 f'FROM {entity_table} e '
                 f'JOIN {data_table} d ON e.id = d."executionId" '
-                f'WHERE e.id > %s{wf_filter_clause} '
-                'ORDER BY e.id ASC '
+                f'WHERE {cursor_clause}{wf_filter_clause} '
+                'ORDER BY e."stoppedAt" ASC, e.id ASC '
                 'LIMIT %s'
             )
-            params = [last_id] + params + [limit]
+            params.append(limit)
         async with conn.cursor(row_factory=dict_row) as cur:
-            logger.debug("Executing batch fetch SQL (last_id=%s)", last_id)
+            logger.debug("Executing batch fetch SQL (last_stopped=%s last_id=%s)", last_stopped_at, last_id)
             try:
                 # Add explicit timeout to unstick hangs
                 await asyncio.wait_for(cur.execute(sql, tuple(params)), timeout=30.0)
@@ -186,7 +204,6 @@ class ExecutionSource:
                         await conn.rollback()
                 except Exception:  # pragma: no cover
                     pass
-                # Friendly message for missing tables (likely prefix mismatch)
                 if psycopg is not None and isinstance(ex, getattr(psycopg.errors, "UndefinedTable", tuple())):
                     logger.error(
                         "Table lookup failed. Attempted tables: %s, %s (schema=%s, prefix=%r). "
@@ -201,7 +218,10 @@ class ExecutionSource:
             return rows
 
     async def stream(
-        self, start_after_id: Optional[int] = None, limit: Optional[int] = None
+        self,
+        start_after_id: Optional[int] = None,
+        start_after_stopped_at: Optional[str] = None,
+        limit: Optional[int] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Stream execution records from the database.
 
@@ -211,8 +231,8 @@ class ExecutionSource:
         available.
 
         Args:
-            start_after_id: If provided, streaming will start from the record
-                immediately after this execution ID (exclusive).
+            start_after_id: Cursor part 2: Execution ID.
+            start_after_stopped_at: Cursor part 1: ISO timestamp string of stoppedAt.
             limit: The total maximum number of records to yield. If None, it
                 streams until the end of the table.
 
@@ -224,6 +244,7 @@ class ExecutionSource:
             return
 
         last_id = start_after_id or 0
+        last_stopped = start_after_stopped_at
         yielded = 0
 
         while True:
@@ -244,13 +265,13 @@ class ExecutionSource:
                             batch_limit = self._batch_size
 
                         # Fetch with timeout
-                        rows = await self._fetch_batch(conn, last_id, batch_limit)
+                        rows = await self._fetch_batch(conn, last_id, last_stopped, batch_limit)
 
                         if not rows:
                             # End of table reached
                             # Log and exit cleanly
                             logger.info(
-                                "Stream completed: yielded=%d start_after_id=%s final_last_id=%d", yielded, start_after_id, last_id
+                                "Stream completed: yielded=%d last_cursor=(%s, %d)", yielded, last_stopped, last_id
                             )
                             return
 
@@ -258,13 +279,19 @@ class ExecutionSource:
                             yield row
                             yielded += 1
                             last_id = row["id"]
+                            # stoppedAt is datetime object from psycopg
+                            st = row["stoppedAt"]
+                            if st:
+                                # Convert to ISO string for next query
+                                last_stopped = st.isoformat()
+                            
                             if limit is not None and yielded >= limit:
                                 break
                         
                         # Small yield to event loop
                         await asyncio.sleep(0)
-
+                        
             except Exception as e:
                 # Log error and retry connection (infinite retry loop)
-                logger.error("Streaming error (last_id=%s): %s. Reconnecting in 5s...", last_id, e)
+                logger.error("Streaming error (cursor=%s, %s): %s. Reconnecting in 5s...", last_stopped, last_id, e)
                 await asyncio.sleep(5)

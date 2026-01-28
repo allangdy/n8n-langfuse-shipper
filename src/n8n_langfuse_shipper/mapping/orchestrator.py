@@ -1052,13 +1052,30 @@ def _map_execution(
     root_output_val: Any = None
     root_output_run_index: Optional[int] = None
     for _start_ts_raw, node_name, idx, run in flattened:
+        start_time = _epoch_ms_to_dt(run.startTime)
+        end_time = start_time + timedelta(milliseconds=run.executionTime or 0)
+
+        # Check for root span duplication (n8n self-referential node run anomaly)
+        # Some n8n versions/workflow patterns produce a self-referential node run
+        # that mimics the entire execution (same name, same start/end time).
+        # We skip these to avoid creating duplicate root-like spans that skew costs.
+        if (
+            node_name == trace.name
+            and start_time == root_span.start_time
+            and end_time == root_span.end_time
+        ):
+            logger.warning(
+                "Skipping node run '%s' [%d] as it appears to be a duplicate of the root span (timestamps match)",
+                node_name,
+                idx,
+            )
+            continue
+
         wf_meta = ctx.wf_node_lookup.get(node_name, {})
         node_type = wf_meta.get("type") or node_name
         category = wf_meta.get("category")
         obs_type_guess = map_node_to_observation_type(node_type, category)
         span_id = str(uuid5(SPAN_NAMESPACE, f"{ctx.trace_id}:{node_name}:{idx}"))
-        start_time = _epoch_ms_to_dt(run.startTime)
-        end_time = start_time + timedelta(milliseconds=run.executionTime or 0)
         parent_id, prev_node, prev_node_run = _resolve_parent(
             node_name=node_name,
             run=run,
