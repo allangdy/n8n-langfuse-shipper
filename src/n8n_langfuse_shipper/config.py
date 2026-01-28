@@ -214,6 +214,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Filtering: Skip traces that have no AI spans at all
+    SKIP_NO_AI_SPANS: bool = Field(
+        default=False,
+        description=(
+            "If true, do not export traces that contain zero AI-related spans. "
+            "This applies even if FILTER_AI_ONLY is false. The execution is still "
+            "checkpointed as processed."
+        ),
+    )
+
     # ---------------- Node Extraction (for AI-only filtering) -----------------
     # Use Any type to prevent Pydantic Settings JSON decoding; validator converts to list[str]
     FILTER_AI_EXTRACTION_NODES: Any = Field(

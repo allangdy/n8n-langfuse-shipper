@@ -299,6 +299,15 @@ def shipper(
             "If not specified, uses FILTER_AI_ONLY from config/env."
         ),
     ),
+    skip_no_ai_spans: bool = typer.Option(
+        False,
+        "--skip-no-ai-spans/--no-skip-no-ai-spans",
+        help=(
+            "If true, do not export ANY data for traces that contain zero AI-related spans. "
+            "Checkpointing still occurs. Effective even if filter-ai-only is false."
+            "If not specified, uses SKIP_NO_AI_SPANS from config/env."
+        ),
+    ),
 ) -> None:
     """Run a shipper cycle to process and export n8n executions.
 
@@ -336,9 +345,11 @@ def shipper(
 
     # Check sys.argv for filter-ai-only and require-execution-metadata flags
     filter_ai_explicit = "--filter-ai-only" in sys.argv or "--no-filter-ai-only" in sys.argv
+    skip_no_ai_explicit = "--skip-no-ai-spans" in sys.argv or "--no-skip-no-ai-spans" in sys.argv
     require_meta_explicit = "--require-execution-metadata" in sys.argv or "--no-require-execution-metadata" in sys.argv
 
     effective_filter_ai_only = filter_ai_only if filter_ai_explicit else settings.FILTER_AI_ONLY
+    effective_skip_no_ai = skip_no_ai_spans if skip_no_ai_explicit else settings.SKIP_NO_AI_SPANS
     require_meta_flag = require_execution_metadata if require_meta_explicit else settings.REQUIRE_EXECUTION_METADATA
 
     source = ExecutionSource(
@@ -441,33 +452,72 @@ def shipper(
                     logging.getLogger(__name__).debug(
                         "Execution %s mapped to %d spans", record.id, span_count
                     )
-                export_trace(
-                    trace,
-                    settings,
-                    dry_run=effective_dry_run,
-                    langfuse_trace_id_field_name=settings.LANGFUSE_TRACE_ID_FIELD_NAME,
-                )
-                if settings.ENABLE_MEDIA_UPLOAD and mapped is not None:
-                    # Now that OTLP span ids are populated, perform media create + upload.
-                    try:
-                        patch_and_upload_media(mapped, settings)
-                    except Exception as e:  # pragma: no cover - non-fatal path
-                        logging.getLogger(__name__).warning(
-                            "media upload phase failed execution=%s err=%s", record.id, e
-                        )
-                # Track earliest / latest window for user reconciliation with Langfuse UI filters.
-                if earliest_started is None or record.startedAt < earliest_started:
-                    earliest_started = record.startedAt
-                if latest_started is None or record.startedAt > latest_started:
-                    latest_started = record.startedAt
-                if debug:
+
+                # Skip export if configured to ignore traces without AI spans.
+                # Logic: 
+                # 1. If filter_ai_only was True, the root span metadata already has 'n8n.filter.no_ai_spans' set if no AI found.
+                # 2. If filter_ai_only was False, we must scan the trace manually for any AI spans.
+                skip_export = False
+                if effective_skip_no_ai:
+                    if effective_filter_ai_only:
+                        # Rely on mapper metadata
+                        root_span = trace.spans[0]
+                        if root_span.metadata.get("n8n.filter.no_ai_spans"):
+                            skip_export = True
+                    else:
+                        # Manual scan: check for generation type OR ai node type in metadata
+                        has_ai = False
+                        for s in trace.spans:
+                            # Root span is not an AI span itself usually, but check all.
+                            if s.observation_type == "generation":
+                                has_ai = True; break
+                            # Check metadata for node type classification (requires importing is_ai_node or trust metadata)
+                            # The mapper populates n8n.node.type and n8n.node.category.
+                            # We can reuse is_ai_node from observation_mapper here or trust existing metadata.
+                            # Note: observation_mapper is not fully imported in __main__.
+                            # Let's import it locally to be safe.
+                            from .observation_mapper import is_ai_node as _is_ai_node
+                            
+                            ntype = s.metadata.get("n8n.node.type")
+                            ncat = s.metadata.get("n8n.node.category")
+                            if _is_ai_node(ntype, ncat):
+                                has_ai = True; break
+                        
+                        if not has_ai:
+                            skip_export = True
+
+                if skip_export:
                     logging.getLogger(__name__).info(
-                        "Exported execution %s -> trace %s spans=%d startedAt=%s",
-                        record.id,
-                        trace.id,
-                        len(trace.spans),
-                        record.startedAt.isoformat(),
+                        "Skipping export of execution %s: No AI spans found (SKIP_NO_AI_SPANS=True)", record.id
                     )
+                else:
+                    export_trace(
+                        trace,
+                        settings,
+                        dry_run=effective_dry_run,
+                        langfuse_trace_id_field_name=settings.LANGFUSE_TRACE_ID_FIELD_NAME,
+                    )
+                    if settings.ENABLE_MEDIA_UPLOAD and mapped is not None:
+                        # Now that OTLP span ids are populated, perform media create + upload.
+                        try:
+                            patch_and_upload_media(mapped, settings)
+                        except Exception as e:  # pragma: no cover - non-fatal path
+                            logging.getLogger(__name__).warning(
+                                "media upload phase failed execution=%s err=%s", record.id, e
+                            )
+                    # Track earliest / latest window for user reconciliation with Langfuse UI filters.
+                    if earliest_started is None or record.startedAt < earliest_started:
+                        earliest_started = record.startedAt
+                    if latest_started is None or record.startedAt > latest_started:
+                        latest_started = record.startedAt
+                    if debug:
+                        logging.getLogger(__name__).info(
+                            "Exported execution %s -> trace %s spans=%d startedAt=%s",
+                            record.id,
+                            trace.id,
+                            len(trace.spans),
+                            record.startedAt.isoformat(),
+                        )
             except Exception as e:
                 # Catch processing errors to prevent restart loops (which cause duplication)
                 # Log error with full context and skip this record
