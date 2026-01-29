@@ -36,6 +36,7 @@ class ResultData(BaseModel):
     """Contains the `runData`, which maps node names to their execution runs."""
 
     runData: Dict[str, List[NodeRun]] = Field(default_factory=dict)
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class ExecutionDataDetails(BaseModel):

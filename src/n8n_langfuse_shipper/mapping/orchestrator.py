@@ -974,11 +974,33 @@ def _map_execution(
     if stopped_raw is not None and stopped_raw.tzinfo is None:
         stopped_raw = stopped_raw.replace(tzinfo=timezone.utc)
     base_name = record.workflowData.name or "execution"
+
+    # Extract session_id and user_id from execution metadata (if present)
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+    try:
+        res_meta = record.data.executionData.resultData.metadata
+        if res_meta:
+            # Check common keys for session identifier
+            raw_sid = res_meta.get("session_hash") or res_meta.get("sessionId")
+            if raw_sid is not None:
+                session_id = str(raw_sid)
+            
+            # Check common keys for user identifier
+            # Priority: user_id > userId (chat_id logic removed per user request)
+            raw_uid = res_meta.get("user_id") or res_meta.get("userId")
+            if raw_uid is not None:
+                user_id = str(raw_uid)
+    except Exception:
+        pass
+
     trace = LangfuseTrace(
         id=trace_id,
         name=base_name,
         timestamp=started_at,
         metadata={"workflowId": record.workflowId, "status": record.status},
+        session_id=session_id,
+        user_id=user_id,
     )
     root_span_id = str(uuid5(SPAN_NAMESPACE, f"{trace_id}:root"))
     root_span = LangfuseSpan(
