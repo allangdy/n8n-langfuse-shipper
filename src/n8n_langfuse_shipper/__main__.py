@@ -123,10 +123,13 @@ def _build_execution_data(
             parsed_root = flatted_parse(serialized)
             parsed_root = _sanitize_flatted(parsed_root)
             # Expect structure: root.resultData.runData
-            run_data = (
+            result_data_dict = (
                 parsed_root.get("resultData", {})
-                .get("runData", {})
-            ) if isinstance(parsed_root, dict) else {}
+                if isinstance(parsed_root, dict) else {}
+            )
+            run_data = result_data_dict.get("runData", {})
+            meta_data = result_data_dict.get("metadata")
+
             if isinstance(run_data, dict) and run_data:
                 if debug:
                     logger.info(
@@ -136,7 +139,7 @@ def _build_execution_data(
                     )
                 return ExecutionData(
                     executionData=ExecutionDataDetails(
-                        resultData=ResultData(runData=run_data)
+                        resultData=ResultData(runData=run_data, metadata=meta_data)
                     )
                 )
         except Exception as e:  # pragma: no cover - fail open
@@ -158,11 +161,11 @@ def _build_execution_data(
                 )
         return empty
 
-    # Helper to materialize ExecutionData from a run_data dict
-    def _from_run_data(rd: dict[str, Any]) -> ExecutionData:
+    # Helper to materialize ExecutionData from run_data and optional metadata
+    def _from_result_data(rd: dict[str, Any], md: Optional[dict[str, Any]] = None) -> ExecutionData:
         return ExecutionData(
             executionData=ExecutionDataDetails(
-                resultData=ResultData(runData=rd)
+                resultData=ResultData(runData=rd, metadata=md)
             )
         )
 
@@ -183,42 +186,50 @@ def _build_execution_data(
         except ValidationError as ve:
             logger.debug("ExecutionData validation failed: %s", ve)
 
-    # Probe multiple candidate paths for runData
-    candidates: list[Any] = []
-    try:
-        candidates.append(raw_data.get("executionData", {}).get("resultData", {}).get("runData"))
-    except Exception:
-        pass
-    try:
-        candidates.append(raw_data.get("resultData", {}).get("runData"))
-    except Exception:
-        pass
-    candidates.append(raw_data.get("runData"))
-    # Some n8n versions embed an "data" key with nested executionData again.
-    try:
-        nested_data = raw_data.get("data")
-        if isinstance(nested_data, dict):
-            candidates.append(nested_data.get("executionData", {}).get("resultData", {}).get("runData"))
-            candidates.append(nested_data.get("resultData", {}).get("runData"))
-    except Exception:
-        pass
+    # Probe multiple candidate paths for ResultData (containing runData)
+    # Each candidate is a dict that MIGHT contain runData and metadata
+    result_data_candidates: list[Any] = []
 
-    for cand in candidates:
-        if isinstance(cand, dict) and cand:
-            if debug:
-                logger.info(
-                    "Execution %s: Recovered runData via alternative path with %d node keys",
-                    execution_id,
-                    len(cand),
-                )
-            return _from_run_data(cand)
+    # Path 1: raw_data.executionData.resultData
+    try:
+        result_data_candidates.append(raw_data.get("executionData", {}).get("resultData"))
+    except Exception: pass
+
+    # Path 2: raw_data.resultData
+    try:
+        result_data_candidates.append(raw_data.get("resultData"))
+    except Exception: pass
+
+    # Path 3: raw_data itself (if it has runData directly)
+    result_data_candidates.append(raw_data)
+
+    # Path 4: nested data key
+    try:
+        nested = raw_data.get("data")
+        if isinstance(nested, dict):
+             result_data_candidates.append(nested.get("executionData", {}).get("resultData"))
+             result_data_candidates.append(nested.get("resultData"))
+    except Exception: pass
+
+    for cand in result_data_candidates:
+        if isinstance(cand, dict) and cand.get("runData"):
+             rd = cand["runData"]
+             md = cand.get("metadata")
+             if isinstance(rd, dict) and rd:
+                 if debug:
+                    logger.info(
+                        "Execution %s: Recovered runData via alternative path with %d node keys",
+                        execution_id,
+                        len(rd),
+                    )
+                 return _from_result_data(rd, md)
 
     # Last chance: workflowData fallback (non-standard)
     if workflow_data_raw and isinstance(workflow_data_raw, dict):
         maybe_rd = workflow_data_raw.get("runData") or workflow_data_raw.get("resultData", {}).get("runData")
         if isinstance(maybe_rd, dict) and maybe_rd:
             logger.warning("Recovered runData from workflowData (non-standard storage)")
-            return _from_run_data(maybe_rd)
+            return _from_result_data(maybe_rd)
 
     if debug:
         logger.warning(
@@ -570,6 +581,7 @@ def shipper(
                 earliest_started.isoformat() if earliest_started else None,
                 latest_started.isoformat() if latest_started else None,
             )
+        logging.getLogger(__name__).info("Shipper cycle completed successfully.")
 
     asyncio.run(_run())
     # Ensure exporter flush & shutdown for short-lived process reliability
