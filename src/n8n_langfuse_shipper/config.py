@@ -224,6 +224,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---------------- Runtime Loop -----------------
+    POLL_INTERVAL: int = Field(
+        default=0,
+        description=(
+            "Time in seconds to sleep when no new executions are found before retrying. "
+            "If 0 (default), the shipper exits after processing the current batch (or reaching limit). "
+            "Set to >0 to run as a continuous service."
+        ),
+    )
+
     # ---------------- Node Extraction (for AI-only filtering) -----------------
     # Use Any type to prevent Pydantic Settings JSON decoding; validator converts to list[str]
     FILTER_AI_EXTRACTION_NODES: Any = Field(

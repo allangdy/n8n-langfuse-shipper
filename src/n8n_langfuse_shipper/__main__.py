@@ -319,6 +319,10 @@ def shipper(
             "If not specified, uses SKIP_NO_AI_SPANS from config/env."
         ),
     ),
+    poll_interval: Optional[int] = typer.Option(
+        None,
+        help="Seconds to sleep when no new executions found. If 0 (default), exit after batch. Overrides POLL_INTERVAL.",
+    ),
 ) -> None:
     """Run a shipper cycle to process and export n8n executions.
 
@@ -362,6 +366,7 @@ def shipper(
     effective_filter_ai_only = filter_ai_only if filter_ai_explicit else settings.FILTER_AI_ONLY
     effective_skip_no_ai = skip_no_ai_spans if skip_no_ai_explicit else settings.SKIP_NO_AI_SPANS
     require_meta_flag = require_execution_metadata if require_meta_explicit else settings.REQUIRE_EXECUTION_METADATA
+    effective_poll_interval = poll_interval if poll_interval is not None else settings.POLL_INTERVAL
 
     source = ExecutionSource(
         settings.PG_DSN,
@@ -387,7 +392,7 @@ def shipper(
             )
 
     async def _run() -> None:
-        count: int = 0
+        # Load checkpoint once
         last_id: Optional[int] = effective_start_after_id
         last_stopped_at: Optional[str] = effective_start_after_stopped_at
         
@@ -395,193 +400,212 @@ def shipper(
         earliest_started: Optional[datetime] = None
         latest_started: Optional[datetime] = None
 
-        async for raw in source.stream(
-            start_after_id=effective_start_after_id, 
-            start_after_stopped_at=effective_start_after_stopped_at, 
-            limit=limit
-        ):
-            try:
-                record = N8nExecutionRecord(
-                    id=raw["id"],
-                    workflowId=raw["workflowId"],
-                    status=raw["status"],
-                    startedAt=raw["startedAt"],
-                    stoppedAt=raw["stoppedAt"],
-                    workflowData=WorkflowData(**raw["workflowData"]),
-                    # Attempt to parse full execution data (with runData). Fallback to empty if shape unexpected.
-                    data=_build_execution_data(
-                        raw.get("data"),
-                        workflow_data_raw=raw.get("workflowData"),
-                        debug=effective_debug,
-                        attempt_decompress=effective_decompress,
-                        execution_id=raw["id"],
-                    ),
-                )
-                if effective_debug and effective_dump_dir:
-                    try:
-                        import json
-                        import os as _os
-                        _os.makedirs(effective_dump_dir, exist_ok=True)
-                        dump_path = _os.path.join(effective_dump_dir, f"execution_{record.id}_data.json")
-                        with open(dump_path, "w", encoding="utf-8") as f:
-                            json.dump(raw.get("data"), f, ensure_ascii=False, indent=2)
-                        logging.getLogger(__name__).info("Dumped raw data JSON to %s", dump_path)
-                    except Exception as e:
-                        logging.getLogger(__name__).warning("Failed dumping raw data JSON: %s", e)
-                effective_trunc: Optional[int] = (
-                    settings.TRUNCATE_FIELD_LEN if truncate_len is None else truncate_len
-                )
-                if effective_trunc == 0:
-                    effective_trunc = None  # signal no truncation
-                # Media upload feature path (Langfuse Media API).
-                # Phase order change: we first export spans to obtain OTLP span ids
-                # (observation ids) then run media upload so create_media can link
-                # assets to observations. Tokens patched locally after export; the
-                # OTLP-exported span output may not include tokens (contract
-                # update documented in instructions & README).
-                mapped = None  # for media upload path later
-                if settings.ENABLE_MEDIA_UPLOAD:
-                    mapped = map_execution_with_assets(
-                        record,
-                        truncate_limit=effective_trunc,
-                        collect_binaries=True,
-                        filter_ai_only=effective_filter_ai_only,
-                    )
-                    trace = mapped.trace
-                else:
-                    trace = map_execution_to_langfuse(
-                        record,
-                        truncate_limit=effective_trunc,
-                        filter_ai_only=effective_filter_ai_only,
-                    )
-                span_count = len(trace.spans)
-                if span_count <= 1:
-                    logging.getLogger(__name__).warning(
-                        "Execution %s produced %d span(s); likely missing runData. workflowId=%s", record.id, span_count, record.workflowId
-                    )
-                else:
-                    logging.getLogger(__name__).debug(
-                        "Execution %s mapped to %d spans", record.id, span_count
-                    )
-
-                # Skip export if configured to ignore traces without AI spans.
-                # Logic: 
-                # 1. If filter_ai_only was True, the root span metadata already has 'n8n.filter.no_ai_spans' set if no AI found.
-                # 2. If filter_ai_only was False, we must scan the trace manually for any AI spans.
-                skip_export = False
-                if effective_skip_no_ai:
-                    if effective_filter_ai_only:
-                        # Rely on mapper metadata
-                        root_span = trace.spans[0]
-                        if root_span.metadata.get("n8n.filter.no_ai_spans"):
-                            skip_export = True
-                    else:
-                        # Manual scan: check for generation type OR ai node type in metadata
-                        has_ai = False
-                        for s in trace.spans:
-                            # Root span is not an AI span itself usually, but check all.
-                            if s.observation_type == "generation":
-                                has_ai = True; break
-                            # Check metadata for node type classification (requires importing is_ai_node or trust metadata)
-                            # The mapper populates n8n.node.type and n8n.node.category.
-                            # We can reuse is_ai_node from observation_mapper here or trust existing metadata.
-                            # Note: observation_mapper is not fully imported in __main__.
-                            # Let's import it locally to be safe.
-                            from .observation_mapper import is_ai_node as _is_ai_node
-                            
-                            ntype = s.metadata.get("n8n.node.type")
-                            ncat = s.metadata.get("n8n.node.category")
-                            if _is_ai_node(ntype, ncat):
-                                has_ai = True; break
-                        
-                        if not has_ai:
-                            skip_export = True
-
-                if skip_export:
-                    logging.getLogger(__name__).info(
-                        "Skipping export of execution %s: No AI spans found (SKIP_NO_AI_SPANS=True)", record.id
-                    )
-                else:
-                    export_trace(
-                        trace,
-                        settings,
-                        dry_run=effective_dry_run,
-                        langfuse_trace_id_field_name=settings.LANGFUSE_TRACE_ID_FIELD_NAME,
-                    )
-                    if settings.ENABLE_MEDIA_UPLOAD and mapped is not None:
-                        # Now that OTLP span ids are populated, perform media create + upload.
-                        try:
-                            patch_and_upload_media(mapped, settings)
-                        except Exception as e:  # pragma: no cover - non-fatal path
-                            logging.getLogger(__name__).warning(
-                                "media upload phase failed execution=%s err=%s", record.id, e
-                            )
-                    # Track earliest / latest window for user reconciliation with Langfuse UI filters.
-                    if earliest_started is None or record.startedAt < earliest_started:
-                        earliest_started = record.startedAt
-                    if latest_started is None or record.startedAt > latest_started:
-                        latest_started = record.startedAt
-                    if debug:
-                        logging.getLogger(__name__).info(
-                            "Exported execution %s -> trace %s spans=%d startedAt=%s",
-                            record.id,
-                            trace.id,
-                            len(trace.spans),
-                            record.startedAt.isoformat(),
-                        )
-            except Exception as e:
-                # Catch processing errors to prevent restart loops (which cause duplication)
-                # Log error with full context and skip this record
-                logging.getLogger(__name__).error(
-                    "Skipping execution %s due to processing error: %s",
-                    raw.get("id"),
-                    e,
-                    exc_info=True,
-                )
+        while True:
+            count_this_batch: int = 0
             
-            count += 1
-            # Update cursor even on error to ensure we advance past the bad record
-            last_id = int(raw["id"])
-            if raw.get("stoppedAt"):
-                last_stopped_at = raw["stoppedAt"].isoformat()
+            async for raw in source.stream(
+                start_after_id=last_id, 
+                start_after_stopped_at=last_stopped_at, 
+                limit=limit
+            ):
+                try:
+                    record = N8nExecutionRecord(
+                        id=raw["id"],
+                        workflowId=raw["workflowId"],
+                        status=raw["status"],
+                        startedAt=raw["startedAt"],
+                        stoppedAt=raw["stoppedAt"],
+                        workflowData=WorkflowData(**raw["workflowData"]),
+                        # Attempt to parse full execution data (with runData). Fallback to empty if shape unexpected.
+                        data=_build_execution_data(
+                            raw.get("data"),
+                            workflow_data_raw=raw.get("workflowData"),
+                            debug=effective_debug,
+                            attempt_decompress=effective_decompress,
+                            execution_id=raw["id"],
+                        ),
+                    )
+                    if effective_debug and effective_dump_dir:
+                        try:
+                            import json
+                            import os as _os
+                            _os.makedirs(effective_dump_dir, exist_ok=True)
+                            dump_path = _os.path.join(effective_dump_dir, f"execution_{record.id}_data.json")
+                            with open(dump_path, "w", encoding="utf-8") as f:
+                                json.dump(raw.get("data"), f, ensure_ascii=False, indent=2)
+                            logging.getLogger(__name__).info("Dumped raw data JSON to %s", dump_path)
+                        except Exception as e:
+                            logging.getLogger(__name__).warning("Failed dumping raw data JSON: %s", e)
+                    effective_trunc: Optional[int] = (
+                        settings.TRUNCATE_FIELD_LEN if truncate_len is None else truncate_len
+                    )
+                    if effective_trunc == 0:
+                        effective_trunc = None  # signal no truncation
+                    # Media upload feature path (Langfuse Media API).
+                    # Phase order change: we first export spans to obtain OTLP span ids
+                    # (observation ids) then run media upload so create_media can link
+                    # assets to observations. Tokens patched locally after export; the
+                    # OTLP-exported span output may not include tokens (contract
+                    # update documented in instructions & README).
+                    mapped = None  # for media upload path later
+                    if settings.ENABLE_MEDIA_UPLOAD:
+                        mapped = map_execution_with_assets(
+                            record,
+                            truncate_limit=effective_trunc,
+                            collect_binaries=True,
+                            filter_ai_only=effective_filter_ai_only,
+                        )
+                        trace = mapped.trace
+                    else:
+                        trace = map_execution_to_langfuse(
+                            record,
+                            truncate_limit=effective_trunc,
+                            filter_ai_only=effective_filter_ai_only,
+                        )
+                    span_count = len(trace.spans)
+                    if span_count <= 1:
+                        logging.getLogger(__name__).warning(
+                            "Execution %s produced %d span(s); likely missing runData. workflowId=%s", record.id, span_count, record.workflowId
+                        )
+                    else:
+                        logging.getLogger(__name__).debug(
+                            "Execution %s mapped to %d spans", record.id, span_count
+                        )
 
-            # Periodic checkpointing for long-running stream safety.
-            # Strategy: Only checkpoint when we are sure the OTLP exporter has flushed the data
-            # (count is multiple of FLUSH_EVERY_N_TRACES) AND we have processed a reasonable
-            # batch (e.g. >= 50) to avoid excessive disk I/O.
-            if not effective_dry_run and last_id is not None:
-                flush_n = max(1, settings.FLUSH_EVERY_N_TRACES)
-                # Ensure checkpoint_n is a multiple of flush_n and >= 50
-                min_batch = 50
-                if flush_n >= min_batch:
-                    checkpoint_n = flush_n
-                else:
-                    # Round up min_batch to next multiple of flush_n
-                    checkpoint_n = ((min_batch + flush_n - 1) // flush_n) * flush_n
+                    # Skip export if configured to ignore traces without AI spans.
+                    # Logic: 
+                    # 1. If filter_ai_only was True, the root span metadata already has 'n8n.filter.no_ai_spans' set if no AI found.
+                    # 2. If filter_ai_only was False, we must scan the trace manually for any AI spans.
+                    skip_export = False
+                    if effective_skip_no_ai:
+                        if effective_filter_ai_only:
+                            # Rely on mapper metadata
+                            root_span = trace.spans[0]
+                            if root_span.metadata.get("n8n.filter.no_ai_spans"):
+                                skip_export = True
+                        else:
+                            # Manual scan: check for generation type OR ai node type in metadata
+                            has_ai = False
+                            for s in trace.spans:
+                                # Root span is not an AI span itself usually, but check all.
+                                if s.observation_type == "generation":
+                                    has_ai = True; break
+                                # Check metadata for node type classification (requires importing is_ai_node or trust metadata)
+                                # The mapper populates n8n.node.type and n8n.node.category.
+                                # We can reuse is_ai_node from observation_mapper here or trust existing metadata.
+                                # Note: observation_mapper is not fully imported in __main__.
+                                # Let's import it locally to be safe.
+                                from .observation_mapper import is_ai_node as _is_ai_node
+                                
+                                ntype = s.metadata.get("n8n.node.type")
+                                ncat = s.metadata.get("n8n.node.category")
+                                if _is_ai_node(ntype, ncat):
+                                    has_ai = True; break
+                            
+                            if not has_ai:
+                                skip_export = True
+
+                    if skip_export:
+                        logging.getLogger(__name__).info(
+                            "Skipping export of execution %s: No AI spans found (SKIP_NO_AI_SPANS=True)", record.id
+                        )
+                    else:
+                        export_trace(
+                            trace,
+                            settings,
+                            dry_run=effective_dry_run,
+                            langfuse_trace_id_field_name=settings.LANGFUSE_TRACE_ID_FIELD_NAME,
+                        )
+                        if settings.ENABLE_MEDIA_UPLOAD and mapped is not None:
+                            # Now that OTLP span ids are populated, perform media create + upload.
+                            try:
+                                patch_and_upload_media(mapped, settings)
+                            except Exception as e:  # pragma: no cover - non-fatal path
+                                logging.getLogger(__name__).warning(
+                                    "media upload phase failed execution=%s err=%s", record.id, e
+                                )
+                        # Track earliest / latest window for user reconciliation with Langfuse UI filters.
+                        if earliest_started is None or record.startedAt < earliest_started:
+                            earliest_started = record.startedAt
+                        if latest_started is None or record.startedAt > latest_started:
+                            latest_started = record.startedAt
+                        if debug:
+                            logging.getLogger(__name__).info(
+                                "Exported execution %s -> trace %s spans=%d startedAt=%s",
+                                record.id,
+                                trace.id,
+                                len(trace.spans),
+                                record.startedAt.isoformat(),
+                            )
+                except Exception as e:
+                    # Catch processing errors to prevent restart loops (which cause duplication)
+                    # Log error with full context and skip this record
+                    logging.getLogger(__name__).error(
+                        "Skipping execution %s due to processing error: %s",
+                        raw.get("id"),
+                        e,
+                        exc_info=True,
+                    )
                 
-                if count % checkpoint_n == 0:
-                    store_checkpoint(cp_path, last_id, last_stopped_at)
-                    logging.getLogger(__name__).debug("Stored periodic checkpoint %s|%s", last_stopped_at, last_id)
+                count_this_batch += 1
+                # Update cursor even on error to ensure we advance past the bad record
+                last_id = int(raw["id"])
+                if raw.get("stoppedAt"):
+                    last_stopped_at = raw["stoppedAt"].isoformat()
 
-        if not effective_dry_run and last_id is not None:
-            store_checkpoint(cp_path, last_id, last_stopped_at)
-            logging.getLogger(__name__).info(
-                "Stored checkpoint %s|%s to %s", last_stopped_at, last_id, cp_path
+                # Periodic checkpointing for long-running stream safety.
+                # Strategy: Only checkpoint when we are sure the OTLP exporter has flushed the data
+                # (count is multiple of FLUSH_EVERY_N_TRACES) AND we have processed a reasonable
+                # batch (e.g. >= 50) to avoid excessive disk I/O.
+                if not effective_dry_run and last_id is not None:
+                    flush_n = max(1, settings.FLUSH_EVERY_N_TRACES)
+                    # Ensure checkpoint_n is a multiple of flush_n and >= 50
+                    min_batch = 50
+                    if flush_n >= min_batch:
+                        checkpoint_n = flush_n
+                    else:
+                        # Round up min_batch to next multiple of flush_n
+                        checkpoint_n = ((min_batch + flush_n - 1) // flush_n) * flush_n
+                    
+                    if count_this_batch % checkpoint_n == 0:
+                        store_checkpoint(cp_path, last_id, last_stopped_at)
+                        logging.getLogger(__name__).debug("Stored periodic checkpoint %s|%s", last_stopped_at, last_id)
+
+            # End of batch/stream loop
+            if not effective_dry_run and last_id is not None and count_this_batch > 0:
+                store_checkpoint(cp_path, last_id, last_stopped_at)
+                logging.getLogger(__name__).info(
+                    "Stored checkpoint %s|%s to %s", last_stopped_at, last_id, cp_path
+                )
+
+            typer.echo(
+                f"Batch processed {count_this_batch} execution(s). dry_run={effective_dry_run} cursor={last_id}"
             )
-        typer.echo(
-            f"Processed {count} execution(s). dry_run={effective_dry_run} start_after={effective_start_after_id}"
-        )
-        if count:
-            logging.getLogger(__name__).info(
-                (
-                    "Execution time window processed: earliest_started=%s "
-                    "latest_started=%s (UTC). If Langfuse UI date filter excludes part of "
-                    "this range, displayed trace count may be lower."
-                ),
-                earliest_started.isoformat() if earliest_started else None,
-                latest_started.isoformat() if latest_started else None,
-            )
-        logging.getLogger(__name__).info("Shipper cycle completed successfully.")
+            
+            if count_this_batch > 0:
+                logging.getLogger(__name__).info(
+                    (
+                        "Execution time window processed: earliest_started=%s "
+                        "latest_started=%s (UTC). If Langfuse UI date filter excludes part of "
+                        "this range, displayed trace count may be lower."
+                    ),
+                    earliest_started.isoformat() if earliest_started else None,
+                    latest_started.isoformat() if latest_started else None,
+                )
+
+            # Polling logic
+            if effective_poll_interval > 0:
+                if limit is None or count_this_batch < limit:
+                    logging.getLogger(__name__).info(
+                        "Caught up (count=%d). Sleeping %ds...", count_this_batch, effective_poll_interval
+                    )
+                    await asyncio.sleep(effective_poll_interval)
+                else:
+                    # Hit limit, yield briefly then continue
+                    await asyncio.sleep(0.1)
+            else:
+                logging.getLogger(__name__).info("Shipper cycle completed (single-run mode).")
+                break
 
     asyncio.run(_run())
     # Ensure exporter flush & shutdown for short-lived process reliability
